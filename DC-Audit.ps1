@@ -23,11 +23,14 @@
     the drive root. Audit output can include administrator membership,
     password policy, shares, and credential manager listings.
 
-    -Cleanup uses those same owner and link checks, then exits without
-    collecting. Deletion does not follow junctions or symbolic links.
-    Drive roots, the Windows directory, and Desktop paths are refused.
-    Folders left on the Desktop by older copies of this script are not
-    removed automatically.
+    -Cleanup applies that same restricted ACL, checks it, and only then
+    deletes anything. It removes top-level regular files and then the
+    directory. A child folder, junction, or symbolic link stops cleanup
+    before those files are deleted. The marker is removed and created
+    again instead of being rewritten, and a marker with more than one
+    hard link is refused. Drive roots, the Windows directory, and Desktop
+    paths are refused. Folders left on the Desktop by older copies of
+    this script are not removed automatically.
 
 .PARAMETER OutputFolder
     Folder that receives the audit files. Defaults to a directory under
@@ -38,8 +41,9 @@
 .PARAMETER Cleanup
     Remove the audit output folder and exit. Does not collect new data.
     The folder must be owned by Administrators or the current user and must
-    contain the .dc-audit-output marker. Junctions and symbolic links are
-    refused, and deletion does not follow them.
+    contain the .dc-audit-output marker. The restricted ACL is applied and
+    checked before anything is deleted. Only top-level regular files are
+    removed. A child folder, junction, or symbolic link stops the cleanup.
 
 .EXAMPLE
     .\DC-Audit.ps1
@@ -56,8 +60,10 @@
 
 .NOTES
     The marker file .dc-audit-output records that this script created the
-    folder. -Cleanup also requires the owner and link checks. A marker file
-    on a junction, symbolic link, or folder owned by someone else is ignored.
+    folder. An existing marker is deleted and a new file is created in its
+    place. A junction, symbolic link, or hard link (more than one name for
+    the same file) is refused. -Cleanup also requires the owner check and
+    the restricted ACL before it deletes anything.
 #>
 [CmdletBinding()]
 param(
@@ -257,7 +263,10 @@ function Test-DcAuditReparsePoint {
     $attributes = [System.IO.File]::GetAttributes($Path)
     $isReparse = (([int]$attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0)
     $linkType = [string](Get-Item -LiteralPath $Path -Force -ErrorAction Stop).LinkType
-    return ($isReparse -or -not [string]::IsNullOrWhiteSpace($linkType))
+    # Hard links are not reparse points. Junctions and symbolic links are.
+    $isNamedLink = [string]::Equals($linkType, 'SymbolicLink', [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals($linkType, 'Junction', [System.StringComparison]::OrdinalIgnoreCase)
+    return ($isReparse -or $isNamedLink)
 }
 
 function Test-DcAuditIsDirectory {
@@ -348,15 +357,7 @@ function Set-DcAuditFolderAcl {
         if (-not (Test-DcAuditMarker -Folder $Folder)) {
             throw "Refusing to reuse '$Folder' because it is not a DC audit output folder."
         }
-        $acl = Get-Acl -LiteralPath $Folder
-        $ownerAndGroup = $acl.GetSecurityDescriptorSddlForm(
-            [System.Security.AccessControl.AccessControlSections]'Owner, Group')
-        if ([string]::IsNullOrWhiteSpace($ownerAndGroup)) {
-            $ownerAndGroup = "O:$userSid"
-        }
-        $acl.SetSecurityDescriptorSddlForm($ownerAndGroup + (Get-DcAuditDaclSddl -UserSid $userSid))
-        Set-Acl -LiteralPath $Folder -AclObject $acl
-        Assert-DcAuditAcl -Folder $Folder -UserSid $userSid
+        Set-DcAuditRestrictedAcl -Folder $Folder -UserSid $userSid
         return $userSid
     }
 
@@ -424,43 +425,172 @@ function Assert-DcAuditAcl {
     }
 }
 
-function Write-DcAuditMarker {
-    param([Parameter(Mandatory)][string]$Folder)
-    Set-Content -LiteralPath (Get-DcAuditMarkerPath -Folder $Folder) -Value $MarkerValue -Encoding ascii -ErrorAction Stop
+function Set-DcAuditRestrictedAcl {
+    param(
+        [Parameter(Mandatory)][string]$Folder,
+        [Parameter(Mandatory)][string]$UserSid
+    )
+    $acl = Get-Acl -LiteralPath $Folder
+    $ownerAndGroup = $acl.GetSecurityDescriptorSddlForm(
+        [System.Security.AccessControl.AccessControlSections]'Owner, Group')
+    if ([string]::IsNullOrWhiteSpace($ownerAndGroup)) {
+        $ownerAndGroup = "O:$UserSid"
+    }
+    $acl.SetSecurityDescriptorSddlForm($ownerAndGroup + (Get-DcAuditDaclSddl -UserSid $UserSid))
+    Set-Acl -LiteralPath $Folder -AclObject $acl
+    Assert-DcAuditAcl -Folder $Folder -UserSid $UserSid
 }
 
-function Remove-DcAuditChild {
+function Get-DcAuditHardLinkCount {
     param([Parameter(Mandatory)][string]$Path)
-    # A junction or symbolic link is removed as a link. Recursive deletion is
-    # never used on a reparse point, so the target is left in place.
-    if (Test-DcAuditReparsePoint -Path $Path) {
-        $attributes = [System.IO.File]::GetAttributes($Path)
-        if (([int]$attributes -band [int][System.IO.FileAttributes]::Directory) -ne 0) {
-            [System.IO.Directory]::Delete($Path, $false)
-        } else {
-            [System.IO.File]::Delete($Path)
+    # Hard links do not have the reparse-point attribute, so the link count
+    # is checked separately. More than one name means this path is not the
+    # only name for the file.
+    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Unix) {
+        $rawCount = & stat -c '%h' -- $Path
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to read the hard-link count for '$Path'."
         }
+        $countText = "$rawCount".Trim()
+        if ($countText -notmatch '^\d+$') {
+            throw "Unable to read the hard-link count for '$Path'."
+        }
+        return [int]$countText
+    }
+    if (-not ('DcAuditNative.FileLinks' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace DcAuditNative {
+    public static class FileLinks {
+        [StructLayout(LayoutKind.Sequential)]
+        struct ByHandleFileInformation {
+            public uint FileAttributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetFileInformationByHandle(IntPtr handle, out ByHandleFileInformation info);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr handle);
+        public static int GetLinkCount(string path) {
+            IntPtr handle = CreateFile(path, 0x80, 7, IntPtr.Zero, 3, 0, IntPtr.Zero);
+            if (handle == new IntPtr(-1)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            try {
+                ByHandleFileInformation info;
+                if (!GetFileInformationByHandle(handle, out info)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                return (int)info.NumberOfLinks;
+            } finally {
+                CloseHandle(handle);
+            }
+        }
+    }
+}
+'@
+    }
+    return [DcAuditNative.FileLinks]::GetLinkCount($Path)
+}
+
+function Assert-DcAuditMarkerFile {
+    param([Parameter(Mandatory)][string]$Folder)
+    $markerPath = Get-DcAuditMarkerPath -Folder $Folder
+    if (-not (Test-DcAuditPathExists -Path $markerPath)) {
         return
+    }
+    if (Test-DcAuditReparsePoint -Path $markerPath) {
+        throw "Refusing to use '$markerPath' because it is a junction or symbolic link."
+    }
+    $attributes = [System.IO.File]::GetAttributes($markerPath)
+    if (([int]$attributes -band [int][System.IO.FileAttributes]::Directory) -ne 0) {
+        throw "Refusing to use '$markerPath' because it is a folder."
+    }
+    $linkCount = Get-DcAuditHardLinkCount -Path $markerPath
+    if ($linkCount -gt 1) {
+        throw "Refusing to use '$markerPath' because it has $linkCount hard links."
+    }
+}
+
+function Write-DcAuditMarker {
+    param([Parameter(Mandatory)][string]$Folder)
+    $markerPath = Get-DcAuditMarkerPath -Folder $Folder
+    if (Test-DcAuditPathExists -Path $markerPath) {
+        Assert-DcAuditMarkerFile -Folder $Folder
+        [System.IO.File]::Delete($markerPath)
+    }
+    if (Test-DcAuditPathExists -Path $markerPath) {
+        throw "Refusing to create '$markerPath' because the previous marker is still present."
+    }
+    $stream = New-Object System.IO.FileStream (
+        $markerPath,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None)
+    try {
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($MarkerValue + "`r`n")
+        $stream.Write($bytes, 0, $bytes.Length)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function Test-DcAuditChildBlocked {
+    param([Parameter(Mandatory)][string]$Path)
+    if (Test-DcAuditReparsePoint -Path $Path) {
+        return $true
     }
     $attributes = [System.IO.File]::GetAttributes($Path)
-    if (([int]$attributes -band [int][System.IO.FileAttributes]::Directory) -ne 0) {
-        Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | ForEach-Object {
-            Remove-DcAuditChild -Path $_.FullName
-        }
-        [System.IO.Directory]::Delete($Path, $false)
-        return
+    return (([int]$attributes -band [int][System.IO.FileAttributes]::Directory) -ne 0)
+}
+
+function Remove-DcAuditTopLevelFiles {
+    param(
+        [Parameter(Mandatory)][string]$Folder,
+        [switch]$KeepMarker
+    )
+    if (Test-DcAuditReparsePoint -Path $Folder) {
+        throw "Refusing to delete anything in '$Folder' because it is a junction or symbolic link."
     }
-    [System.IO.File]::Delete($Path)
+    # This script never creates subfolders. A folder or reparse point is
+    # unexpected, so stop before deleting any name in the directory.
+    $children = @(Get-ChildItem -LiteralPath $Folder -Force -ErrorAction Stop)
+    foreach ($child in $children) {
+        $blocked = Test-DcAuditChildBlocked -Path $child.FullName
+        if ($blocked) {
+            throw "Refusing to delete anything in '$Folder' because '$($child.Name)' is a folder, junction, or symbolic link. Remove it manually and run the script again."
+        }
+    }
+    foreach ($child in $children) {
+        if ($KeepMarker -and $child.Name -eq $MarkerName) {
+            continue
+        }
+        if (-not (Test-DcAuditPathExists -Path $child.FullName)) {
+            continue
+        }
+        if (Test-DcAuditChildBlocked -Path $child.FullName) {
+            throw "Stopped deleting '$Folder' because '$($child.Name)' is no longer a regular file."
+        }
+        [System.IO.File]::Delete($child.FullName)
+    }
 }
 
 function Clear-DcAuditFiles {
     param([Parameter(Mandatory)][string]$Folder)
-    if (Test-DcAuditReparsePoint -Path $Folder) {
-        throw "Refusing to clear '$Folder' because it is a junction or symbolic link."
-    }
-    Get-ChildItem -LiteralPath $Folder -Force -ErrorAction Stop |
-        Where-Object { $_.Name -ne $MarkerName } |
-        ForEach-Object { Remove-DcAuditChild -Path $_.FullName }
+    Assert-DcAuditMarkerFile -Folder $Folder
+    Remove-DcAuditTopLevelFiles -Folder $Folder -KeepMarker
 }
 
 function Remove-DcAuditOutputFolder {
@@ -476,12 +606,26 @@ function Remove-DcAuditOutputFolder {
     if (-not (Test-DcAuditMarker -Folder $Folder)) {
         throw "Refusing to remove '$Folder' because it is not a DC audit output folder (missing $MarkerName marker)."
     }
+    Assert-DcAuditMarkerFile -Folder $Folder
     # The marker is not sufficient. The owner must also be Administrators or the current user.
     Assert-DcAuditOwner -Folder $Folder
     if (Test-DcAuditReparsePoint -Path $Folder) {
         throw "Refusing to remove '$Folder' because it is a junction or symbolic link."
     }
-    Remove-DcAuditChild -Path $Folder
+    $userSid = Get-DcAuditCurrentUserSid
+    Set-DcAuditRestrictedAcl -Folder $Folder -UserSid $userSid
+    if (Test-DcAuditReparsePoint -Path $Folder) {
+        throw "Refusing to remove '$Folder' because it is a junction or symbolic link."
+    }
+    Remove-DcAuditTopLevelFiles -Folder $Folder
+    $remaining = @(Get-ChildItem -LiteralPath $Folder -Force -ErrorAction Stop)
+    if ($remaining.Count -gt 0) {
+        throw "Refusing to remove '$Folder' because items are still present."
+    }
+    if (Test-DcAuditReparsePoint -Path $Folder) {
+        throw "Refusing to remove '$Folder' because it is a junction or symbolic link."
+    }
+    [System.IO.Directory]::Delete($Folder, $false)
     Write-Host "Removed DC audit output folder: $Folder"
 }
 
