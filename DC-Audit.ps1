@@ -62,14 +62,18 @@
     The marker file .dc-audit-output records that this script created the
     folder. An existing marker is deleted and a new file is created in its
     place. A junction, symbolic link, or hard link (more than one name for
-    the same file) is refused. -Cleanup also requires the owner check and
-    the restricted ACL before it deletes anything.
+    the same file) is refused. The marker is accepted only when its
+    hard-link count is exactly 1; a missing or unreadable count is refused.
+    -Cleanup also requires the owner check and the restricted ACL before
+    it deletes anything.
 #>
 [CmdletBinding()]
 param(
     [string]$OutputFolder = "$env:ProgramData\$env:COMPUTERNAME DC Audit",
     [switch]$Cleanup
 )
+
+$ErrorActionPreference = 'Stop'
 
 $MarkerName = '.dc-audit-output'
 $MarkerValue = 'DC-Audit.ps1'
@@ -462,6 +466,7 @@ function Get-DcAuditHardLinkCount {
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 namespace DcAuditNative {
     public static class FileLinks {
         [StructLayout(LayoutKind.Sequential)]
@@ -477,25 +482,30 @@ namespace DcAuditNative {
             public uint FileIndexHigh;
             public uint FileIndexLow;
         }
+        const uint FileReadAttributes = 0x80;
+        const uint OpenExisting = 3;
+        // FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS
+        const uint OpenFlags = 0x00200000 | 0x02000000;
+        const uint FileAttributeReparsePoint = 0x400;
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
         [DllImport("kernel32.dll", SetLastError = true)]
-        static extern bool GetFileInformationByHandle(IntPtr handle, out ByHandleFileInformation info);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        static extern bool CloseHandle(IntPtr handle);
+        static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation info);
         public static int GetLinkCount(string path) {
-            IntPtr handle = CreateFile(path, 0x80, 7, IntPtr.Zero, 3, 0, IntPtr.Zero);
-            if (handle == new IntPtr(-1)) {
+            IntPtr raw = CreateFile(path, FileReadAttributes, 7, IntPtr.Zero, OpenExisting, OpenFlags, IntPtr.Zero);
+            if (raw == IntPtr.Zero || raw == new IntPtr(-1)) {
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             }
-            try {
+            using (SafeFileHandle handle = new SafeFileHandle(raw, true)) {
                 ByHandleFileInformation info;
                 if (!GetFileInformationByHandle(handle, out info)) {
                     throw new Win32Exception(Marshal.GetLastWin32Error());
                 }
+                if ((info.FileAttributes & FileAttributeReparsePoint) != 0) {
+                    throw new InvalidOperationException("The opened handle is a reparse point.");
+                }
                 return (int)info.NumberOfLinks;
-            } finally {
-                CloseHandle(handle);
             }
         }
     }
@@ -519,8 +529,8 @@ function Assert-DcAuditMarkerFile {
         throw "Refusing to use '$markerPath' because it is a folder."
     }
     $linkCount = Get-DcAuditHardLinkCount -Path $markerPath
-    if ($linkCount -gt 1) {
-        throw "Refusing to use '$markerPath' because it has $linkCount hard links."
+    if ($linkCount -isnot [int] -or $linkCount -ne 1) {
+        throw "Refusing to use '$markerPath' because its hard-link count is '$linkCount'."
     }
 }
 
