@@ -7,28 +7,39 @@
     folder is "$env:ProgramData\<computer name> DC Audit", under
     $env:ProgramData. The Desktop is not used.
 
-    The folder is created with inheritance disabled. Its ACL grants
-    FullControl only to BUILTIN\Administrators (S-1-5-32-544) and the user
-    running this script, and child files inherit that ACL. Audit output can
-    include administrator membership, password policy, shares, and credential
-    manager listings, so it stays in that restricted folder.
+    A new folder is created with its ACL already in place. Inheritance is
+    disabled, and FullControl is granted only to BUILTIN\Administrators
+    (S-1-5-32-544) and the user running this script. Child files inherit
+    that ACL. Windows PowerShell 5.1 creates it with
+    Directory.CreateDirectory. PowerShell 7 and later uses
+    FileSystemAclExtensions.Create. If the new folder is not empty, the
+    script stops before writing audit data.
 
-    -Cleanup removes the output folder and exits without collecting. Removal
-    runs only when this script's marker file (.dc-audit-output) is present.
+    An existing folder is reused only when three checks all pass: it and
+    any parent below ProgramData are not junctions or symbolic links, its
+    owner is Administrators or the current user, and it contains the marker
+    file .dc-audit-output. The marker is not accepted by itself. For an
+    output path outside ProgramData, the same link check continues up to
+    the drive root. Audit output can include administrator membership,
+    password policy, shares, and credential manager listings.
+
+    -Cleanup uses those same owner and link checks, then exits without
+    collecting. Deletion does not follow junctions or symbolic links.
     Drive roots, the Windows directory, and Desktop paths are refused.
-
     Folders left on the Desktop by older copies of this script are not
     removed automatically.
 
 .PARAMETER OutputFolder
     Folder that receives the audit files. Defaults to a directory under
     $env:ProgramData named "<computer name> DC Audit". The parent directory
-    must already exist. This cannot be the Desktop, a drive root, or the
-    Windows directory.
+    must already exist and must not be a junction or symbolic link. This
+    cannot be the Desktop, a drive root, or the Windows directory.
 
 .PARAMETER Cleanup
     Remove the audit output folder and exit. Does not collect new data.
-    The folder must contain the .dc-audit-output marker written by this script.
+    The folder must be owned by Administrators or the current user and must
+    contain the .dc-audit-output marker. Junctions and symbolic links are
+    refused, and deletion does not follow them.
 
 .EXAMPLE
     .\DC-Audit.ps1
@@ -44,8 +55,9 @@
     Deletes the default ProgramData audit folder created by this script.
 
 .NOTES
-    The marker file .dc-audit-output identifies a folder this script created.
-    -Cleanup will not delete a path that lacks that marker.
+    The marker file .dc-audit-output records that this script created the
+    folder. -Cleanup also requires the owner and link checks. A marker file
+    on a junction, symbolic link, or folder owned by someone else is ignored.
 #>
 [CmdletBinding()]
 param(
@@ -65,7 +77,15 @@ function Get-DcAuditMarkerPath {
 function Test-DcAuditMarker {
     param([Parameter(Mandatory)][string]$Folder)
     $markerPath = Get-DcAuditMarkerPath -Folder $Folder
-    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+    if (-not (Test-DcAuditPathExists -Path $markerPath)) {
+        return $false
+    }
+    # A link named as the marker is not evidence the folder was created here.
+    if (Test-DcAuditReparsePoint -Path $markerPath) {
+        return $false
+    }
+    $attributes = [System.IO.File]::GetAttributes($markerPath)
+    if (([int]$attributes -band [int][System.IO.FileAttributes]::Directory) -ne 0) {
         return $false
     }
     $text = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop
@@ -173,51 +193,187 @@ function Get-DcAuditDaclSddl {
     return $sddl
 }
 
+function Get-DcAuditCurrentUserSid {
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ($null -eq $currentUser -or [string]::IsNullOrWhiteSpace($currentUser.Value)) {
+        throw 'Unable to resolve the current user security identifier for the audit folder ACL.'
+    }
+    return $currentUser.Value
+}
+
+function New-DcAuditDirectorySecurity {
+    param([Parameter(Mandatory)][string]$UserSid)
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetAccessRuleProtection($true, $false)
+    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $inheritance = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $propagation = [System.Security.AccessControl.PropagationFlags]::None
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    $administrators = New-Object System.Security.Principal.SecurityIdentifier $AdministratorsSid
+    $security.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $administrators, $rights, $inheritance, $propagation, $allow)))
+    if (-not [string]::Equals($UserSid, $AdministratorsSid, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $currentUser = New-Object System.Security.Principal.SecurityIdentifier $UserSid
+        $security.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $currentUser, $rights, $inheritance, $propagation, $allow)))
+    }
+    return $security
+}
+
+function New-DcAuditRestrictedDirectory {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][System.Security.AccessControl.DirectorySecurity]$Security
+    )
+    # Apply the ACL as the directory is created. Windows PowerShell 5.1 and
+    # PowerShell 7 expose that through different APIs.
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        $directoryInfo = New-Object System.IO.DirectoryInfo $Path
+        [void][System.IO.FileSystemAclExtensions]::Create($directoryInfo, $Security)
+        return
+    }
+    [void][System.IO.Directory]::CreateDirectory($Path, $Security)
+}
+
+function Test-DcAuditPathExists {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $null = [System.IO.File]::GetAttributes($Path)
+        return $true
+    } catch [System.IO.FileNotFoundException] {
+        return $false
+    } catch [System.IO.DirectoryNotFoundException] {
+        return $false
+    }
+}
+
+function Test-DcAuditReparsePoint {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-DcAuditPathExists -Path $Path)) {
+        return $false
+    }
+    # Both signals are checked. GetAttributes and Get-Item inspect the final
+    # path component itself and do not treat a parent link as this component.
+    $attributes = [System.IO.File]::GetAttributes($Path)
+    $isReparse = (([int]$attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0)
+    $linkType = [string](Get-Item -LiteralPath $Path -Force -ErrorAction Stop).LinkType
+    return ($isReparse -or -not [string]::IsNullOrWhiteSpace($linkType))
+}
+
+function Test-DcAuditIsDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+    if (Test-DcAuditReparsePoint -Path $Path) {
+        return $false
+    }
+    $attributes = [System.IO.File]::GetAttributes($Path)
+    return (([int]$attributes -band [int][System.IO.FileAttributes]::Directory) -ne 0)
+}
+
+function Get-DcAuditReparseCheckPaths {
+    param([Parameter(Mandatory)][string]$Folder)
+    $full = [System.IO.Path]::GetFullPath($Folder).TrimEnd('\', '/')
+    $stop = $null
+    if (-not [string]::IsNullOrWhiteSpace($env:ProgramData)) {
+        $programData = [System.IO.Path]::GetFullPath($env:ProgramData).TrimEnd('\', '/')
+        if (Test-DcAuditSameOrChildPath -Candidate $full -Parent $programData) {
+            # ProgramData is the trust boundary. Check the folder and every
+            # parent strictly below it, not ProgramData itself.
+            $stop = $programData
+        }
+    }
+    $paths = @($full)
+    $current = $full
+    while ($true) {
+        $parent = [System.IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrWhiteSpace($parent)) {
+            break
+        }
+        $parent = $parent.TrimEnd('\', '/')
+        if ([string]::IsNullOrWhiteSpace($parent)) {
+            break
+        }
+        if ($null -ne $stop -and [string]::Equals($parent, $stop, [System.StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $root = [System.IO.Path]::GetPathRoot($parent)
+        if (-not [string]::IsNullOrWhiteSpace($root) -and
+            [string]::Equals($parent, $root.TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $paths += $parent
+        $current = $parent
+    }
+    return $paths
+}
+
+function Assert-DcAuditNoReparsePoint {
+    param([Parameter(Mandatory)][string]$Folder)
+    foreach ($path in @(Get-DcAuditReparseCheckPaths -Folder $Folder)) {
+        if (-not (Test-DcAuditPathExists -Path $path)) {
+            continue
+        }
+        if (Test-DcAuditReparsePoint -Path $path) {
+            throw "Refusing to use '$path' because it is a junction or symbolic link."
+        }
+    }
+}
+
+function Assert-DcAuditOwner {
+    param([Parameter(Mandatory)][string]$Folder)
+    $acl = Get-Acl -LiteralPath $Folder
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+    if ($null -eq $owner -or [string]::IsNullOrWhiteSpace($owner.Value)) {
+        throw "Refusing to use '$Folder' because its owner could not be read."
+    }
+    $userSid = Get-DcAuditCurrentUserSid
+    $ownerAllowed = [string]::Equals($owner.Value, $AdministratorsSid, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals($owner.Value, $userSid, [System.StringComparison]::OrdinalIgnoreCase)
+    if (-not $ownerAllowed) {
+        throw "Refusing to use '$Folder' because its owner is not Administrators or the current user."
+    }
+}
+
 function Set-DcAuditFolderAcl {
     param([Parameter(Mandatory)][string]$Folder)
 
-    $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-    if ($null -eq $userSid -or [string]::IsNullOrWhiteSpace($userSid.Value)) {
-        throw 'Unable to resolve the current user security identifier for the audit folder ACL.'
-    }
+    $userSid = Get-DcAuditCurrentUserSid
+    Assert-DcAuditNoReparsePoint -Folder $Folder
 
-    $created = $false
-    if (Test-Path -LiteralPath $Folder) {
-        if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
+    if (Test-DcAuditPathExists -Path $Folder) {
+        if (-not (Test-DcAuditIsDirectory -Path $Folder)) {
             throw "Output path exists and is not a directory: $Folder"
         }
+        # The marker only identifies the folder. Owner and link checks are required too.
+        Assert-DcAuditOwner -Folder $Folder
         if (-not (Test-DcAuditMarker -Folder $Folder)) {
-            throw "Refusing to reuse '$Folder' because it is not a DC-Audit.ps1 output folder."
+            throw "Refusing to reuse '$Folder' because it is not a DC audit output folder."
         }
-    } else {
-        $parent = Split-Path -Path $Folder -Parent
-        if ([string]::IsNullOrWhiteSpace($parent) -or -not (Test-Path -LiteralPath $parent -PathType Container)) {
-            throw "Parent directory does not exist: $parent"
-        }
-        # Create the directory first, then replace its ACL before any audit file is written.
-        New-Item -ItemType Directory -Path $Folder -ErrorAction Stop | Out-Null
-        $created = $true
-    }
-
-    try {
         $acl = Get-Acl -LiteralPath $Folder
-        # Keep the current owner and group; replace only the DACL.
         $ownerAndGroup = $acl.GetSecurityDescriptorSddlForm(
             [System.Security.AccessControl.AccessControlSections]'Owner, Group')
         if ([string]::IsNullOrWhiteSpace($ownerAndGroup)) {
-            $ownerAndGroup = "O:$($userSid.Value)"
+            $ownerAndGroup = "O:$userSid"
         }
-        $acl.SetSecurityDescriptorSddlForm($ownerAndGroup + (Get-DcAuditDaclSddl -UserSid $userSid.Value))
+        $acl.SetSecurityDescriptorSddlForm($ownerAndGroup + (Get-DcAuditDaclSddl -UserSid $userSid))
         Set-Acl -LiteralPath $Folder -AclObject $acl
-        Assert-DcAuditAcl -Folder $Folder -UserSid $userSid.Value
-    } catch {
-        if ($created) {
-            Remove-Item -LiteralPath $Folder -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        throw
+        Assert-DcAuditAcl -Folder $Folder -UserSid $userSid
+        return $userSid
     }
 
-    return $userSid.Value
+    $parent = Split-Path -Path $Folder -Parent
+    if ([string]::IsNullOrWhiteSpace($parent) -or -not (Test-DcAuditPathExists -Path $parent)) {
+        throw "Parent directory does not exist: $parent"
+    }
+    $security = New-DcAuditDirectorySecurity -UserSid $userSid
+    New-DcAuditRestrictedDirectory -Path $Folder -Security $security
+    Assert-DcAuditNoReparsePoint -Folder $Folder
+    $children = @(Get-ChildItem -LiteralPath $Folder -Force -ErrorAction Stop)
+    if ($children.Count -gt 0) {
+        throw "Refusing to continue because '$Folder' is not empty."
+    }
+    Assert-DcAuditOwner -Folder $Folder
+    Assert-DcAuditAcl -Folder $Folder -UserSid $userSid
+    return $userSid
 }
 
 function Assert-DcAuditAcl {
@@ -273,26 +429,59 @@ function Write-DcAuditMarker {
     Set-Content -LiteralPath (Get-DcAuditMarkerPath -Folder $Folder) -Value $MarkerValue -Encoding ascii -ErrorAction Stop
 }
 
+function Remove-DcAuditChild {
+    param([Parameter(Mandatory)][string]$Path)
+    # A junction or symbolic link is removed as a link. Recursive deletion is
+    # never used on a reparse point, so the target is left in place.
+    if (Test-DcAuditReparsePoint -Path $Path) {
+        $attributes = [System.IO.File]::GetAttributes($Path)
+        if (([int]$attributes -band [int][System.IO.FileAttributes]::Directory) -ne 0) {
+            [System.IO.Directory]::Delete($Path, $false)
+        } else {
+            [System.IO.File]::Delete($Path)
+        }
+        return
+    }
+    $attributes = [System.IO.File]::GetAttributes($Path)
+    if (([int]$attributes -band [int][System.IO.FileAttributes]::Directory) -ne 0) {
+        Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | ForEach-Object {
+            Remove-DcAuditChild -Path $_.FullName
+        }
+        [System.IO.Directory]::Delete($Path, $false)
+        return
+    }
+    [System.IO.File]::Delete($Path)
+}
+
 function Clear-DcAuditFiles {
     param([Parameter(Mandatory)][string]$Folder)
+    if (Test-DcAuditReparsePoint -Path $Folder) {
+        throw "Refusing to clear '$Folder' because it is a junction or symbolic link."
+    }
     Get-ChildItem -LiteralPath $Folder -Force -ErrorAction Stop |
         Where-Object { $_.Name -ne $MarkerName } |
-        Remove-Item -Recurse -Force -ErrorAction Stop
+        ForEach-Object { Remove-DcAuditChild -Path $_.FullName }
 }
 
 function Remove-DcAuditOutputFolder {
     param([Parameter(Mandatory)][string]$Folder)
-    if (-not (Test-Path -LiteralPath $Folder)) {
+    Assert-DcAuditNoReparsePoint -Folder $Folder
+    if (-not (Test-DcAuditPathExists -Path $Folder)) {
         Write-Host "DC audit output folder is not present: $Folder"
         return
     }
-    if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
+    if (-not (Test-DcAuditIsDirectory -Path $Folder)) {
         throw "Refusing to remove '$Folder' because it is not a directory."
     }
     if (-not (Test-DcAuditMarker -Folder $Folder)) {
-        throw "Refusing to remove '$Folder' because it is not a DC-Audit.ps1 output folder (missing $MarkerName marker)."
+        throw "Refusing to remove '$Folder' because it is not a DC audit output folder (missing $MarkerName marker)."
     }
-    Remove-Item -LiteralPath $Folder -Recurse -Force -ErrorAction Stop
+    # The marker is not sufficient. The owner must also be Administrators or the current user.
+    Assert-DcAuditOwner -Folder $Folder
+    if (Test-DcAuditReparsePoint -Path $Folder) {
+        throw "Refusing to remove '$Folder' because it is a junction or symbolic link."
+    }
+    Remove-DcAuditChild -Path $Folder
     Write-Host "Removed DC audit output folder: $Folder"
 }
 
