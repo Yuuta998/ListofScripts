@@ -76,3 +76,4 @@ Write-Host "=== SUMMARY ($ShellExe) ==="
 $fail = $false
 foreach ($k in $results.Keys) { $v = $results[$k]; $s = if ($v -eq $true) {'PASS'} else {'FAIL'; $fail=$true}; Write-Host "RESULT | $s | $k" }
 if ($fail) { exit 1 }
+exit 0
