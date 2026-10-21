@@ -1,0 +1,20 @@
+name: windows-host-tests
+on:
+  push:
+    branches: [ 'ci/windows-tests-pr1' ]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [ powershell, pwsh ]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests under ${{ matrix.shell }}
+        shell: pwsh
+        run: ./ci/Test-ListofScriptsPr1.ps1 -ShellExe ${{ matrix.shell }}
