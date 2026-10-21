@@ -665,6 +665,8 @@ Write-DcAuditMarker -Folder $OutputFolder
 Write-Host "Writing DC audit output to $OutputFolder"
 Write-Host "ACL: FullControl for Administrators and the current user only. Pass -Cleanup later to remove this folder."
 
+$ErrorActionPreference = 'Continue'
+
 Net LocalGroup Administrators | Out-File -FilePath (Join-Path $OutputFolder '1.Local_Admins.txt')
 Get-ADGroupMember -Identity "Administrators" -Recursive | %{Get-ADUser -Identity $_.distinguishedName} | Select Name, Enabled | Out-File -FilePath (Join-Path $OutputFolder '2.Admins.txt') -append
 Net Group "Domain Admins" | Out-File -FilePath (Join-Path $OutputFolder '2.Admins.txt') -append
